@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>Log-odds 占据栅格地图回放</title>
+<style>
+  body { font-family: -apple-system, "Helvetica Neue", Arial, sans-serif; margin: 24px; background:#fafafa; color:#222; }
+  h1 { font-size: 20px; } h2 { font-size: 15px; margin: 0 0 6px; }
+  .panels { display: flex; gap: 24px; flex-wrap: wrap; }
+  .panel { background:#fff; border:1px solid #ddd; border-radius:8px; padding:12px; }
+  canvas { image-rendering: pixelated; border:1px solid #ccc; display:block; }
+  .stats { font-size: 12px; margin-top: 6px; color:#444; white-space: pre-line; }
+  .controls { margin: 16px 0; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  button { padding: 4px 12px; cursor:pointer; }
+  input[type=range] { width: 320px; }
+  #anoms { margin-top: 16px; font-size: 12px; background:#fff; border:1px solid #ddd; border-radius:8px; padding:12px; max-width: 1100px; }
+  #anoms .warn { color:#a00; font-weight:600; }
+  #anomlist { max-height: 140px; overflow-y:auto; font-family: Menlo, monospace; }
+  .legend { font-size:12px; color:#555; margin-top:8px; }
+  .sw { display:inline-block; width:12px; height:12px; vertical-align:-2px; margin:0 4px 0 10px; border:1px solid #999;}
+</style>
+</head>
+<body>
+<h1>Log-odds 占据栅格地图 — 逐帧回放</h1>
+<p style="font-size:13px;color:#555;max-width:1100px">
+左右两图接收<b>完全相同</b>的噪声测距数据，仅传感器逆模型置信度不同。左侧为合理模型
+(p<sub>occ</sub>=0.7)，右侧为过度自信模型 (p<sub>occ</sub>=0.97)。黑色小方块为真实障碍物位置。
+过度自信模型会在极少观测后把栅格推向接近 0/1 的极端概率 —— 这些异常收敛会被自动检测并列出。
+</p>
+<div class="controls">
+  <button id="play">▶ 播放</button>
+  <button id="prev">上一帧</button>
+  <button id="next">下一帧</button>
+  <input type="range" id="slider" min="0" value="0">
+  <span id="framelabel"></span>
+  <label>速度 <select id="speed">
+    <option value="1">1 fps</option><option value="2">2 fps</option>
+    <option value="5" selected>5 fps</option><option value="10">10 fps</option>
+    <option value="20">20 fps</option>
+  </select></label>
+</div>
+<div class="panels">
+  <div class="panel"><h2>合理模型 (p_occ=0.7, p_free=0.4)</h2>
+    <canvas id="c0" width="512" height="512"></canvas><div class="stats" id="s0"></div></div>
+  <div class="panel"><h2>过度自信模型 (p_occ=0.97, p_free=0.03)</h2>
+    <canvas id="c1" width="512" height="512"></canvas><div class="stats" id="s1"></div></div>
+</div>
+<div class="legend">
+  颜色：<span class="sw" style="background:#969696"></span>未知 (p=0.5)
+  <span class="sw" style="background:#f5f5f5"></span>空闲 (p→0)
+  <span class="sw" style="background:#c81414"></span>占据 (p→1)
+  <span class="sw" style="background:#000"></span>真实障碍物
+</div>
+<div id="anoms">
+  <div class="warn" id="anomsummary"></div>
+  <div id="anomlist"></div>
+</div>
+<script>
+const DATA = /*__DATA__*/;
+const W = DATA.w, H = DATA.h, N = W * H, CELL = 512 / W;
+
+function b64(s){ const b = atob(s); const a = new Uint8Array(b.length);
+  for (let i=0;i<b.length;i++) a[i]=b.charCodeAt(i); return a; }
+const world = b64(DATA.world);
+const frames = DATA.frames.map(b64); // each: [sane N bytes][over N bytes]
+const anomOver = DATA.anomOver || [], anomSane = DATA.anomSane || [];
+
+const ctxs = [document.getElementById('c0').getContext('2d'),
+              document.getElementById('c1').getContext('2d')];
+const slider = document.getElementById('slider');
+slider.max = frames.length - 1;
+
+function color(v){ // v in [0,1]
+  if (v > 0.5){ const t=(v-0.5)*2; return [Math.round(150+50*t), Math.round(150-130*t), Math.round(150-130*t)]; }
+  const t=(0.5-v)*2, g=Math.round(150+95*t); return [g,g,g];
+}
+function drawMap(ctx, arr, off){
+  for (let y=0;y<H;y++) for (let x=0;x<W;x++){
+    const i=y*W+x, c=color(arr[off+i]/255);
+    ctx.fillStyle='rgb('+c[0]+','+c[1]+','+c[2]+')';
+    ctx.fillRect(x*CELL,y*CELL,CELL,CELL);
+    if (world[i]){ ctx.fillStyle='#000'; ctx.fillRect(x*CELL+CELL/2-1.5,y*CELL+CELL/2-1.5,3,3); }
+  }
+}
+function stats(arr, off){
+  let obs=0, sat=0;
+  for (let i=0;i<N;i++){ const v=arr[off+i];
+    if (v!==128){ obs++; if (v<=5||v>=250) sat++; } }
+  return {obs, sat};
+}
+let cur = 0, timer = null;
+function show(f){
+  cur = Math.max(0, Math.min(frames.length-1, f));
+  slider.value = cur;
+  document.getElementById('framelabel').textContent =
+    '帧 ' + (cur+1) + ' / ' + frames.length + '（扫描 ' + cur + '）';
+  const fr = frames[cur];
+  drawMap(ctxs[0], fr, 0); drawMap(ctxs[1], fr, N);
+  const s0 = stats(fr,0), s1 = stats(fr,N);
+  document.getElementById('s0').textContent =
+    '已观测栅格: '+s0.obs+'  极端概率(≤0.02或≥0.98): '+s0.sat+
+    '\n异常收敛事件: '+anomSane.filter(a=>a.scan<=cur).length;
+  document.getElementById('s1').textContent =
+    '已观测栅格: '+s1.obs+'  极端概率(≤0.02或≥0.98): '+s1.sat+
+    '\n异常收敛事件: '+anomOver.filter(a=>a.scan<=cur).length;
+  const shown = anomOver.filter(a=>a.scan<=cur);
+  document.getElementById('anomsummary').textContent =
+    '过度自信模型异常收敛事件（截至当前帧）: ' + shown.length +
+    ' ；合理模型: ' + anomSane.filter(a=>a.scan<=cur).length;
+  document.getElementById('anomlist').innerHTML = shown.slice(-12).reverse()
+    .map(a=>'扫描 '+a.scan+': 栅格('+a.x+','+a.y+') 仅 '+a.Obs+' 次观测即达到 p='+a.P.toFixed(4))
+    .join('<br>');
+}
+function stop(){ if (timer){ clearInterval(timer); timer=null;
+  document.getElementById('play').textContent='▶ 播放'; } }
+document.getElementById('play').onclick = ()=>{
+  if (timer){ stop(); return; }
+  const fps = +document.getElementById('speed').value;
+  document.getElementById('play').textContent='⏸ 暂停';
+  timer = setInterval(()=>{ if (cur>=frames.length-1){ stop(); return; } show(cur+1); }, 1000/fps);
+};
+document.getElementById('prev').onclick = ()=>{ stop(); show(cur-1); };
+document.getElementById('next').onclick = ()=>{ stop(); show(cur+1); };
+slider.oninput = ()=>{ stop(); show(+slider.value); };
+show(0);
+</script>
+</body>
+</html>
